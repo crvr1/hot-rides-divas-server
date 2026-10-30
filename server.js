@@ -10,6 +10,8 @@
  *     ready, 5s countdown, leave/disconnect cleanup, host migration, time:ping.
  *   - HTTP: GET /, GET /health, GET /live_config.json, POST /telemetry,
  *     POST /admin/maintenance (ADMIN_PASSWORD), CORS for GitHub Pages origin.
+ *   - Ownership: GET /auth/nonce, POST /auth/login, GET /owned, GET /session/me,
+ *     POST /purchase/claim (car|upgrade|pet), POST /purchase/equip — Solana-verified.
  * Connections: loaded by index.js; clients use wss://… (legacy) or /socket.io/
  *              (new lobbies). Tunables served to game clients without rebuild.
  * Env: PORT, ADMIN_PASSWORD (optional; maintenance disabled if unset).
@@ -21,6 +23,7 @@ const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
+const ownership = require('./ownership');
 const { Server: SocketIOServer } = require('socket.io');
 
 // ---------------------------------------------------------------------------
@@ -202,6 +205,7 @@ app.get(['/', '/health'], (_req, res) => {
     clients: legacyClients.size,
     ioClients: io.engine ? io.engine.clientsCount : 0,
     maintenance: maintenanceMode,
+    ownership: ownership.storageInfo(),
     ts: now()
   });
 });
@@ -285,6 +289,124 @@ app.post('/admin/maintenance', (req, res) => {
   io.of('/lobby').emit('maintenance', flag);
   console.log('[admin] maintenanceMode=', maintenanceMode);
   res.status(200).json({ ok: true, maintenance: maintenanceMode });
+});
+
+// ---------------------------------------------------------------------------
+// Wallet ownership / purchase verification (Phantom sign-in + on-chain SOL)
+// Boss car 1 SOL, upgrades, pet_kitten 0.5 SOL → MERCHANT_WALLET
+// ---------------------------------------------------------------------------
+function bearerToken(req, body) {
+  const h = req.headers && req.headers.authorization;
+  if (typeof h === 'string' && /^Bearer\s+/i.test(h)) {
+    return h.replace(/^Bearer\s+/i, '').trim();
+  }
+  if (body && typeof body.token === 'string') return body.token;
+  return '';
+}
+
+app.get('/auth/nonce', (req, res) => {
+  try {
+    const wallet = clampStr(String(req.query.wallet || ''), 64);
+    if (wallet.length < 32) {
+      res.status(400).json({ error: 'wallet required' });
+      return;
+    }
+    res.status(200).json(ownership.issueNonce(wallet));
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
+});
+
+app.post('/auth/login', (req, res) => {
+  try {
+    const body = req.body || {};
+    const wallet = clampStr(String(body.wallet || ''), 64);
+    if (!wallet || !body.signature || !body.message) {
+      res.status(400).json({ error: 'wallet, signature, message required' });
+      return;
+    }
+    res.status(200).json(ownership.login(wallet, body.signature, body.message));
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
+});
+
+app.get('/owned', (req, res) => {
+  try {
+    const wallet = clampStr(String(req.query.wallet || ''), 64);
+    if (wallet.length < 32) {
+      res.status(400).json({ error: 'wallet required' });
+      return;
+    }
+    res.status(200).json(ownership.purchasesOf(wallet));
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
+});
+
+app.get('/session/me', (req, res) => {
+  try {
+    const wallet = ownership.verifySession(bearerToken(req));
+    if (!wallet) {
+      res.status(401).json({ error: 'invalid session' });
+      return;
+    }
+    res.status(200).json({ wallet, purchases: ownership.purchasesOf(wallet) });
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
+});
+
+app.post('/purchase/claim', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const wallet =
+      ownership.verifySession(bearerToken(req, body)) ||
+      clampStr(String(body.wallet || ''), 64);
+    if (!wallet) {
+      res.status(401).json({ error: 'login required' });
+      return;
+    }
+    if (!body.signature) {
+      res.status(400).json({ error: 'signature required' });
+      return;
+    }
+    let purchases;
+    if (body.kind === 'car') {
+      purchases = await ownership.claimCar(wallet, body.id, body.signature);
+    } else if (body.kind === 'upgrade') {
+      purchases = await ownership.claimUpgrade(wallet, body.id, body.level, body.signature);
+    } else if (body.kind === 'pet') {
+      purchases = await ownership.claimPet(wallet, body.id, body.signature);
+    } else {
+      res.status(400).json({ error: 'kind must be car, upgrade, or pet' });
+      return;
+    }
+    res.status(200).json({ ok: true, purchases });
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
+});
+
+app.post('/purchase/equip', (req, res) => {
+  try {
+    const body = req.body || {};
+    const wallet =
+      ownership.verifySession(bearerToken(req, body)) ||
+      clampStr(String(body.wallet || ''), 64);
+    if (!wallet) {
+      res.status(401).json({ error: 'login required' });
+      return;
+    }
+    const petId =
+      body.petId == null || body.petId === ''
+        ? null
+        : clampStr(String(body.petId), 32);
+    const purchases = ownership.setEquippedPet(wallet, petId);
+    res.status(200).json({ ok: true, purchases });
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
 });
 
 // ---------------------------------------------------------------------------
