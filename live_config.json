@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "maintenance": false,
+  "maintenanceMessage": "Upgrading the race engines. Back in a few minutes with better circuits",
+  "asphaltFriction": 1.0,
+  "nitroPower": 1.0,
+  "mapTuning": {
+    "miami-neon": { "friction": 1.0, "nitro": 1.0 },
+    "sunshine-speedway": { "friction": 1.05, "nitro": 0.95 },
+    "neon-kyoto": { "friction": 0.95, "nitro": 1.1 }
+  },
+  "dailyBonusCoins": 250,
+  "dailyBonusStyleMult": 1.5,
+  "trackOfTheDayPool": ["miami-neon", "sunshine-speedway", "neon-kyoto"],
+  "ghostMaxBytes": 48000,
+  "telemetryEnabled": true
+}

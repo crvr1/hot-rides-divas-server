@@ -24,7 +24,9 @@ const express = require('express');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
 const ownership = require('./ownership');
+const p4 = require('./p4-ops');
 const { Server: SocketIOServer } = require('socket.io');
+p4.reloadLiveConfig();
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -59,7 +61,8 @@ const ALLOWED_MAPS = Object.freeze([
   'neon-kyoto',
   'black-eclipse',
   'volcanic-caldera',
-  'random'
+  'random',
+  'random-track'
 ]);
 
 const LIVE_CONFIG_DEFAULTS = Object.freeze({
@@ -143,17 +146,36 @@ let maintenanceMode = false;
 let liveConfig = { ...LIVE_CONFIG_DEFAULTS };
 
 function getLiveConfigPublic() {
+  p4.reloadLiveConfig();
+  const cfg = p4.getLiveConfig();
+  const daily = p4.getDailyState();
+  const friction = clampNumber(
+    cfg.asphaltFriction != null ? cfg.asphaltFriction : liveConfig.asphaltFriction,
+    0.5, 1.5, 1
+  );
+  const nitro = clampNumber(
+    cfg.nitroPower != null ? cfg.nitroPower : liveConfig.n2oPower,
+    0.5, 2.0, 1
+  );
+  const tot = daily.trackOfTheDay || liveConfig.trackOfTheDay || 'miami-neon';
   return {
-    asphaltFriction: clampNumber(liveConfig.asphaltFriction, 0.5, 1.5, 1),
-    n2oPower: clampNumber(liveConfig.n2oPower, 0.5, 2.0, 1),
+    asphaltFriction: friction,
+    n2oPower: nitro,
+    nitroPower: nitro,
     driftAssist: clampNumber(liveConfig.driftAssist, 0, 2, 1),
     aiAggression: clampNumber(liveConfig.aiAggression, 0.25, 2, 1),
-    trackOfTheDay: ALLOWED_MAPS.includes(liveConfig.trackOfTheDay)
-      ? liveConfig.trackOfTheDay
-      : 'miami-neon',
-    styleMultiplier: clampNumber(liveConfig.styleMultiplier, 0.5, 3, 1),
+    trackOfTheDay: ALLOWED_MAPS.includes(tot) ? tot : 'miami-neon',
+    styleMultiplier: clampNumber(
+      cfg.dailyBonusStyleMult != null ? cfg.dailyBonusStyleMult : liveConfig.styleMultiplier,
+      0.5, 3, 1
+    ),
     maxSpeedScale: clampNumber(liveConfig.maxSpeedScale, 0.5, 1.5, 1),
-    maintenance: maintenanceMode,
+    dailyBonusCoins: cfg.dailyBonusCoins != null ? cfg.dailyBonusCoins : 250,
+    dailyBonusStyleMult: cfg.dailyBonusStyleMult != null ? cfg.dailyBonusStyleMult : 1.5,
+    day: daily.day,
+    mapTuning: cfg.mapTuning || {},
+    maintenance: !!(maintenanceMode || cfg.maintenance),
+    maintenanceMessage: cfg.maintenanceMessage || undefined,
     serverNow: now()
   };
 }
@@ -186,7 +208,7 @@ const app = express();
 app.disable('x-powered-by');
 app.use(
   cors({
-    origin: [PAGES_ORIGIN, /\.github\.io$/, /^http:\/\/localhost(?::\d+)?$/],
+    origin: [PAGES_ORIGIN, /\.github\.io$/, /^http:\/\/localhost(?::\d+)?$/, /^http:\/\/127\.0\.0\.1(?::\d+)?$/],
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password']
   })
@@ -378,8 +400,16 @@ app.post('/purchase/claim', async (req, res) => {
       purchases = await ownership.claimUpgrade(wallet, body.id, body.level, body.signature);
     } else if (body.kind === 'pet') {
       purchases = await ownership.claimPet(wallet, body.id, body.signature);
+    } else if (body.kind === 'hrd-cosmetic') {
+      purchases = await ownership.claimHrdCosmetic(wallet, body.id, body.signature);
+    } else if (body.kind === 'hrd-upgrade') {
+      purchases = await ownership.claimHrdUpgrade(wallet, body.id, body.signature);
+    } else if (body.kind === 'hrd-prize-entry') {
+      purchases = await ownership.claimHrdPrizeEntry(wallet, body.signature);
     } else {
-      res.status(400).json({ error: 'kind must be car, upgrade, or pet' });
+      res.status(400).json({
+        error: 'kind must be car, upgrade, pet, hrd-cosmetic, hrd-upgrade, or hrd-prize-entry'
+      });
       return;
     }
     res.status(200).json({ ok: true, purchases });
@@ -409,6 +439,129 @@ app.post('/purchase/equip', (req, res) => {
   }
 });
 
+// --- Phase 4 / Phase 5 extras (p4-ops + $HRD catalog) ---
+app.get('/hrd/catalog', (_req, res) => {
+  res.status(200).json({
+    mint: ownership.HRD_MINT,
+    treasury: process.env.MERCHANT_WALLET || 'BK55uDsiq2BNpmNC2CSa6GzPwr9dYzMvSbou5RNFP4m8',
+    decimals: 6,
+    catalog: ownership.HRD_CATALOG,
+    note: 'Cosmetics and upgrades priced in $HRD. No profit promises. Prize cup grants cosmetics only.'
+  });
+});
+
+app.get('/daily', (_req, res) => {
+  const daily = p4.getDailyState();
+  const cfg = p4.getLiveConfig();
+  res.status(200).json({
+    day: daily.day,
+    trackOfTheDay: daily.trackOfTheDay,
+    dailyBonusCoins: cfg.dailyBonusCoins,
+    dailyBonusStyleMult: cfg.dailyBonusStyleMult,
+    serverNow: now()
+  });
+});
+
+app.post('/daily/claim', (req, res) => {
+  try {
+    const body = req.body || {};
+    const auth = bearerToken(req, body);
+    let wallet = ownership.verifySession(auth) || clampStr(String(body.wallet || ''), 64);
+    if (!wallet || wallet.length < 32) {
+      res.status(401).json({ error: 'login or wallet required' });
+      return;
+    }
+    res.status(200).json(p4.claimDailyBonus(wallet));
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
+});
+
+app.post('/ghost', (req, res) => {
+  try {
+    const body = req.body || {};
+    const auth = bearerToken(req, body);
+    const wallet = ownership.verifySession(auth) || clampStr(String(body.wallet || ''), 64) || null;
+    let buf = null;
+    try {
+      if (typeof body.dataB64 === 'string') buf = Buffer.from(body.dataB64, 'base64');
+    } catch (_) {}
+    const mapId = clampStr(String(body.mapId || 'miami-neon'), 64);
+    const r = p4.saveGhost(mapId, wallet, buf, {
+      timeMs: typeof body.timeMs === 'number' ? body.timeMs : null,
+      driverId: clampStr(String(body.driverId || ''), 16)
+    });
+    if (!r.ok) {
+      res.status(400).json(r);
+      return;
+    }
+    res.status(200).json(r);
+  } catch (e) {
+    res.status(400).json({ error: e.message || String(e) });
+  }
+});
+
+app.get('/ghost', (req, res) => {
+  const mapId = clampStr(String(req.query.mapId || 'miami-neon'), 64);
+  const wallet = clampStr(String(req.query.wallet || 'anon'), 64);
+  const r = p4.loadGhost(mapId, wallet);
+  if (!r.ok) {
+    res.status(404).json({ error: 'no ghost' });
+    return;
+  }
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('X-Ghost-Meta', encodeURIComponent(JSON.stringify(r.meta || {})));
+  res.status(200).end(r.buffer);
+});
+
+app.post('/admin/kill', (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!adminRateOk(ip)) {
+    res.status(429).json({ error: 'rate limit' });
+    return;
+  }
+  const body = req.body || {};
+  const check = p4.adminPasswordOk(body.password || body.adminPassword || '');
+  if (!check.ok) {
+    res.status(401).json({ error: check.reason || 'unauthorized' });
+    return;
+  }
+  const on = body.maintenance !== false;
+  const message = clampStr(String(body.message || body.maintenanceMessage || ''), 240);
+  const cfg = p4.setMaintenance(on, message || undefined);
+  maintenanceMode = !!cfg.maintenance;
+  const flag = {
+    type: 'maintenance',
+    on: !!cfg.maintenance,
+    active: !!cfg.maintenance,
+    message: cfg.maintenanceMessage,
+    serverNow: now()
+  };
+  for (const client of legacyClients.values()) sendLegacy(client.ws, flag);
+  try { io.of('/lobby').emit('maintenance', flag); } catch (_) {}
+  res.status(200).json({ ok: true, maintenance: cfg.maintenance, maintenanceMessage: cfg.maintenanceMessage });
+});
+
+app.post('/admin/unkill', (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!adminRateOk(ip)) {
+    res.status(429).json({ error: 'rate limit' });
+    return;
+  }
+  const body = req.body || {};
+  const check = p4.adminPasswordOk(body.password || body.adminPassword || '');
+  if (!check.ok) {
+    res.status(401).json({ error: check.reason || 'unauthorized' });
+    return;
+  }
+  const cfg = p4.setMaintenance(false);
+  maintenanceMode = false;
+  const flag = { type: 'maintenance', on: false, active: false, serverNow: now() };
+  for (const client of legacyClients.values()) sendLegacy(client.ws, flag);
+  try { io.of('/lobby').emit('maintenance', flag); } catch (_) {}
+  res.status(200).json({ ok: true, maintenance: false });
+});
+
 // ---------------------------------------------------------------------------
 // HTTP server + dual upgrade routing (legacy ws vs socket.io)
 // ---------------------------------------------------------------------------
@@ -417,7 +570,7 @@ const server = http.createServer(app);
 const io = new SocketIOServer(server, {
   path: '/socket.io/',
   cors: {
-    origin: [PAGES_ORIGIN, /\.github\.io$/, /^http:\/\/localhost(?::\d+)?$/],
+    origin: [PAGES_ORIGIN, /\.github\.io$/, /^http:\/\/localhost(?::\d+)?$/, /^http:\/\/127\.0\.0\.1(?::\d+)?$/],
     methods: ['GET', 'POST']
   },
   // We claim non-/socket.io/ upgrades for the legacy ws relay ourselves.
@@ -483,6 +636,8 @@ function lobbyPayload(room) {
       id: p.id,
       name: p.name,
       driverId: p.driverId,
+      carId: p.carId || 'starter',
+      pet: p.pet || null,
       ready: !!p.ready,
       finished: !!p.finished
     });
@@ -647,9 +802,132 @@ function handleLegacyMessage(client, data) {
       leaveLegacyRoom(client, 'leave');
       sendLegacy(client.ws, { type: 'left', serverNow: now() });
       break;
+    case 'ntpSample':
+      sendLegacy(client.ws, { type: 'ntpReply', t: msg.t, serverNow: now(), seq: msg.seq | 0 });
+      break;
+    case 'authBind':
+      onLegacyAuthBind(client, msg);
+      break;
+    case 'setCar':
+      onLegacySetCar(client, msg);
+      break;
+    case 'setPet':
+      onLegacySetPet(client, msg);
+      break;
+    case 'ghostUpload':
+      onLegacyGhostUpload(client, msg);
+      break;
+    case 'ghostRequest':
+      onLegacyGhostRequest(client, msg);
+      break;
     default:
       sendLegacy(client.ws, { type: 'error', message: 'Unknown type: ' + msg.type });
   }
+}
+
+
+function onLegacyAuthBind(client, msg) {
+  const token = clampStr(msg.token || '', 512);
+  const wallet = ownership.verifySession(token);
+  if (!wallet) {
+    sendLegacy(client.ws, { type: 'error', message: 'Invalid session — log in with Phantom in Garage.' });
+    return;
+  }
+  client.wallet = wallet;
+  client.sessionToken = token;
+  const purchases = ownership.purchasesOf(wallet);
+  client.ownsBoss = !!purchases.ownsBoss;
+  const p = playerOfLegacy(client);
+  if (p) {
+    p.wallet = wallet;
+    p.ownsBoss = client.ownsBoss;
+    if (p.carId === ownership.BOSS_CAR_ID && !client.ownsBoss) p.carId = 'starter';
+    if (purchases.equippedPet && ownership.ownsPet(wallet, purchases.equippedPet)) {
+      p.pet = purchases.equippedPet;
+    } else if (p.pet && !ownership.ownsPet(wallet, p.pet)) {
+      p.pet = null;
+    }
+  }
+  sendLegacy(client.ws, {
+    type: 'authOk',
+    wallet,
+    ownsBoss: client.ownsBoss,
+    purchases,
+    serverNow: now()
+  });
+}
+
+function onLegacySetCar(client, msg) {
+  const p = playerOfLegacy(client);
+  if (!p) return;
+  let carId = clampStr(msg.carId || 'starter', 32) || 'starter';
+  if (carId === ownership.BOSS_CAR_ID) {
+    const w = client.wallet || p.wallet;
+    if (!w || !ownership.ownsCar(w, ownership.BOSS_CAR_ID)) {
+      sendLegacy(client.ws, {
+        type: 'error',
+        message: 'BOSS CAR requires a verified 1 SOL purchase on this wallet.'
+      });
+      carId = 'starter';
+    }
+  }
+  p.carId = carId;
+  const room = roomOfLegacy(client);
+  if (room) broadcastLegacy(room, lobbyPayload(room));
+}
+
+function onLegacySetPet(client, msg) {
+  const p = playerOfLegacy(client);
+  if (!p) return;
+  let pet = msg.pet == null || msg.pet === '' ? null : clampStr(msg.pet, 32);
+  if (pet) {
+    const w = client.wallet || p.wallet;
+    if (w && ownership.ownsPet && !ownership.ownsPet(w, pet)) {
+      sendLegacy(client.ws, { type: 'error', message: 'Pet not owned on this wallet.' });
+      pet = null;
+    }
+  }
+  p.pet = pet;
+  const room = roomOfLegacy(client);
+  if (room) broadcastLegacy(room, lobbyPayload(room));
+}
+
+function onLegacyGhostUpload(client, msg) {
+  const mapId = clampStr(msg.mapId || 'miami-neon', 64);
+  let buf = null;
+  try {
+    if (typeof msg.dataB64 === 'string') buf = Buffer.from(msg.dataB64, 'base64');
+  } catch (_) {}
+  const wallet = client.wallet || null;
+  const r = p4.saveGhost(mapId, wallet, buf, {
+    timeMs: typeof msg.timeMs === 'number' ? msg.timeMs : null,
+    driverId: clampStr(msg.driverId || '', 16)
+  });
+  sendLegacy(client.ws, {
+    type: 'ghostSaved',
+    ok: !!r.ok,
+    bytes: r.bytes || 0,
+    error: r.error || null,
+    serverNow: now()
+  });
+}
+
+function onLegacyGhostRequest(client, msg) {
+  const mapId = clampStr(msg.mapId || 'miami-neon', 64);
+  const wallet = clampStr(msg.wallet || '', 64) || client.wallet || 'anon';
+  const r = p4.loadGhost(mapId, wallet);
+  if (!r.ok) {
+    sendLegacy(client.ws, { type: 'ghostData', ok: false, mapId, serverNow: now() });
+    return;
+  }
+  sendLegacy(client.ws, {
+    type: 'ghostData',
+    ok: true,
+    mapId,
+    meta: r.meta || {},
+    dataB64: r.buffer.toString('base64'),
+    serverNow: now()
+  });
 }
 
 function onLegacyCreate(client, msg) {
@@ -684,6 +962,9 @@ function onLegacyCreate(client, msg) {
     id: client.id,
     name,
     driverId,
+    carId: clampStr(msg.carId, 32) || 'starter',
+    pet: null,
+    wallet: client.wallet || null,
     ready: false,
     finished: false,
     finishPlace: null,
@@ -736,6 +1017,9 @@ function onLegacyJoin(client, msg) {
     id: client.id,
     name,
     driverId,
+    carId: clampStr(msg.carId, 32) || 'starter',
+    pet: null,
+    wallet: client.wallet || null,
     ready: false,
     finished: false,
     finishPlace: null,

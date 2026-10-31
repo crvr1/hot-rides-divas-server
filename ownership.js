@@ -5,7 +5,8 @@
  * Env:
  *   DATA_DIR          — directory for ownership.json (default: ./data)
  *   MERCHANT_WALLET   — expected SOL recipient (default: BK55…P4m8)
- *   SOLANA_RPC        — JSON-RPC URL (default: publicnode mainnet)
+ *   SOLANA_RPC_URL    — JSON-RPC URL (alias SOLANA_RPC; default: public mainnet)
+ *   MOCK_VERIFY      — when '1', accept mock signatures for local tests
  *   SESSION_SECRET    — HMAC secret for session tokens
  *   BOSS_CAR_ID       — default boss-car
  *   BOSS_PRICE_SOL    — default 1
@@ -19,7 +20,8 @@ const crypto = require('crypto');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const STORE_PATH = path.join(DATA_DIR, 'ownership.json');
 const MERCHANT = process.env.MERCHANT_WALLET || 'BK55uDsiq2BNpmNC2CSa6GzPwr9dYzMvSbou5RNFP4m8';
-const RPC = process.env.SOLANA_RPC || 'https://solana-rpc.publicnode.com';
+const RPC = process.env.SOLANA_RPC_URL || process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
+const MOCK_VERIFY = process.env.MOCK_VERIFY === '1' || process.env.MOCK_VERIFY === 'true';
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const BOSS_CAR_ID = process.env.BOSS_CAR_ID || 'boss-car';
 const BOSS_PRICE_SOL = Number(process.env.BOSS_PRICE_SOL || 1);
@@ -132,6 +134,8 @@ function walletRec(wallet) {
   if (!Array.isArray(w.pets)) w.pets = [];
   if (w.equippedPet === undefined) w.equippedPet = null;
   if (w.equippedPet && !w.pets.includes(w.equippedPet)) w.equippedPet = null;
+  if (!Array.isArray(w.cosmetics)) w.cosmetics = [];
+  if (!w.hrdUpgrades) w.hrdUpgrades = {};
   return w;
 }
 
@@ -142,11 +146,10 @@ function purchasesOf(wallet) {
     cars: w.cars.slice(),
     pets: (w.pets || []).slice(),
     equippedPet: w.equippedPet || null,
-    upgrades: Object.assign({
-      engine: 0, turbo: 0, tires: 0, brakes: 0, suspension: 0
-    }, w.upgrades || {}),
     ownsBoss: w.cars.includes(BOSS_CAR_ID),
     ownsPetKitten: (w.pets || []).includes(PET_KITTEN_ID),
+    cosmetics: (w.cosmetics || []).slice(),
+    hrdUpgrades: Object.assign({}, w.hrdUpgrades || {}),
     txCount: Object.keys(w.txs).length
   };
 }
@@ -260,6 +263,14 @@ async function rpc(method, params) {
  * Verify a confirmed SystemProgram transfer from `wallet` → MERCHANT for >= minLamports.
  */
 async function verifyTransfer(signature, wallet, minLamports) {
+  if (MOCK_VERIFY && typeof signature === 'string' && signature.startsWith('mock:')) {
+    if (store.usedSignatures[signature]) {
+      const owner = store.usedSignatures[signature];
+      if (owner !== wallet) throw new Error('Transaction already claimed by another wallet');
+      return { already: true, lamports: minLamports };
+    }
+    return { already: false, lamports: minLamports, mock: true };
+  }
   if (store.usedSignatures[signature]) {
     const owner = store.usedSignatures[signature];
     if (owner !== wallet) throw new Error('Transaction already claimed by another wallet');
@@ -395,6 +406,144 @@ function storageInfo() {
   };
 }
 
+
+const HRD_MINT = process.env.HRD_MINT || 'EPkpr81p71DZYypxrFqZh69x1s2mNkHm4Jy8UGPLpump';
+const HRD_DECIMALS = Number(process.env.HRD_DECIMALS || 6);
+const TOKEN_2022 = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+
+/** $HRD catalog — amounts in whole tokens (ui). Cosmetics / upgrades only. */
+const HRD_CATALOG = {
+  cosmetic: {
+    paint_lava: { hrd: 150000, label: 'Lava Reactive Paint' },
+    paint_volt: { hrd: 150000, label: 'Volt Reactive Paint' },
+    aura_lightning: { hrd: 100000, label: 'Anime Lightning Aura' },
+    aura_fireworks: { hrd: 100000, label: 'Fireworks Aura' },
+    aura_neon: { hrd: 100000, label: 'Neon Light Trails' },
+    trail_sakura: { hrd: 75000, label: 'Sakura Trail' }
+  },
+  upgrade: {
+    Engine_Stage_1: { hrd: 50000, applies: { engine: 1 } },
+    Engine_Stage_2: { hrd: 120000, applies: { engine: 2 } },
+    Tires_Drift_Spec: { hrd: 80000, applies: { tires: 1 } },
+    Spoiler_Carbon_V2: { hrd: 60000, applies: { suspension: 1 } },
+    N2O_Bottle: { hrd: 90000, applies: { turbo: 1 } },
+    Brake_Kit_Pro: { hrd: 70000, applies: { brakes: 1 } }
+  },
+  prizeEntry: { hrd: 25000, label: 'Cosmetic Cup Entry' }
+};
+
+/**
+ * Verify Token-2022 transferChecked of $HRD from wallet → treasury (MERCHANT).
+ * Uses token balance deltas on parsed tx when available; falls back to pre/post token balances.
+ */
+async function verifyHrdTransfer(signature, wallet, minRawAmount) {
+  if (MOCK_VERIFY && typeof signature === 'string' && signature.startsWith('mock:')) {
+    if (store.usedSignatures[signature]) {
+      const owner = store.usedSignatures[signature];
+      if (owner !== wallet) throw new Error('Transaction already claimed by another wallet');
+      return { already: true, credited: minRawAmount };
+    }
+    return { already: false, credited: minRawAmount, mock: true };
+  }
+  if (store.usedSignatures[signature]) {
+    const owner = store.usedSignatures[signature];
+    if (owner !== wallet) throw new Error('Transaction already claimed by another wallet');
+    return { already: true };
+  }
+  let tx = null;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    tx = await rpc('getTransaction', [
+      signature,
+      { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }
+    ]);
+    if (tx) break;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  if (!tx) throw new Error('Transaction not found on-chain yet — retry in a few seconds');
+  if (tx.meta && tx.meta.err) throw new Error('Transaction failed on-chain');
+
+  // Prefer token balance deltas (works for SPL Token and Token-2022 ATAs)
+
+  // Token-2022 ATAs: pre/postTokenBalances include mint+owner for TokenzQd… accounts.
+  // Prefer owner-matched treasury delta; already handled above via amountFor(MERCHANT).
+  const pre = (tx.meta && tx.meta.preTokenBalances) || [];
+  const post = (tx.meta && tx.meta.postTokenBalances) || [];
+  function amountFor(list, owner) {
+    let n = 0n;
+    for (const b of list) {
+      if (b.mint !== HRD_MINT) continue;
+      if (b.owner && b.owner !== owner) continue;
+      const a = b.uiTokenAmount && b.uiTokenAmount.amount;
+      if (a != null) n += BigInt(a);
+    }
+    return n;
+  }
+  const preT = amountFor(pre, MERCHANT);
+  const postT = amountFor(post, MERCHANT);
+  let credited = postT - preT;
+  // If owner field missing, sum any HRD mint increase
+  if (credited <= 0n) {
+    const sum = (list) => list.filter((b) => b.mint === HRD_MINT).reduce((a, b) => a + BigInt((b.uiTokenAmount && b.uiTokenAmount.amount) || 0), 0n);
+    credited = sum(post) - sum(pre);
+  }
+  if (credited < BigInt(minRawAmount)) {
+    throw new Error(`Insufficient $HRD transfer: got ${credited}, need >= ${minRawAmount}`);
+  }
+  // Ensure fee payer / signer is wallet
+  const message = tx.transaction && tx.transaction.message;
+  const accountKeys = (message.accountKeys || []).map((k) => (typeof k === 'string' ? k : (k.pubkey || k)));
+  if (accountKeys[0] && accountKeys[0] !== wallet && !accountKeys.includes(wallet)) {
+    throw new Error('Signed-in wallet is not a transaction signer');
+  }
+  return { credited: Number(credited), already: false };
+}
+
+function claimHrdCosmetic(wallet, cosmeticId, signature) {
+  const def = HRD_CATALOG.cosmetic[cosmeticId];
+  if (!def) throw new Error('Unknown cosmetic');
+  const raw = Math.round(def.hrd * Math.pow(10, HRD_DECIMALS));
+  return verifyHrdTransfer(signature, wallet, raw).then((v) => {
+    const w = walletRec(wallet);
+    if (v.already && w.cosmetics.includes(cosmeticId)) return purchasesOf(wallet);
+    if (!w.cosmetics.includes(cosmeticId)) w.cosmetics.push(cosmeticId);
+    w.txs[signature] = { kind: 'hrd-cosmetic', id: cosmeticId, amountHrd: def.hrd, at: Date.now() };
+    store.usedSignatures[signature] = wallet;
+    saveStore(store);
+    return purchasesOf(wallet);
+  });
+}
+
+function claimHrdUpgrade(wallet, upgradeId, signature) {
+  const def = HRD_CATALOG.upgrade[upgradeId];
+  if (!def) throw new Error('Unknown $HRD upgrade');
+  const raw = Math.round(def.hrd * Math.pow(10, HRD_DECIMALS));
+  return verifyHrdTransfer(signature, wallet, raw).then((v) => {
+    const w = walletRec(wallet);
+    if (v.already && w.hrdUpgrades[upgradeId]) return purchasesOf(wallet);
+    w.hrdUpgrades[upgradeId] = true;
+    Object.keys(def.applies || {}).forEach((k) => {
+      w.upgrades[k] = Math.max(w.upgrades[k] || 0, def.applies[k]);
+    });
+    w.txs[signature] = { kind: 'hrd-upgrade', id: upgradeId, amountHrd: def.hrd, at: Date.now() };
+    store.usedSignatures[signature] = wallet;
+    saveStore(store);
+    return purchasesOf(wallet);
+  });
+}
+
+function claimHrdPrizeEntry(wallet, signature) {
+  const def = HRD_CATALOG.prizeEntry;
+  const raw = Math.round(def.hrd * Math.pow(10, HRD_DECIMALS));
+  return verifyHrdTransfer(signature, wallet, raw).then((v) => {
+    const w = walletRec(wallet);
+    w.txs[signature] = { kind: 'hrd-prize-entry', amountHrd: def.hrd, at: Date.now() };
+    if (!v.already) store.usedSignatures[signature] = wallet;
+    saveStore(store);
+    return purchasesOf(wallet);
+  });
+}
+
+
 module.exports = {
   BOSS_CAR_ID,
   PET_KITTEN_ID,
@@ -410,5 +559,10 @@ module.exports = {
   ownsPet,
   storageInfo,
   CATALOG,
+  HRD_CATALOG,
+  HRD_MINT,
+  claimHrdCosmetic,
+  claimHrdUpgrade,
+  claimHrdPrizeEntry,
   reload() { store = loadStore(); }
 };
